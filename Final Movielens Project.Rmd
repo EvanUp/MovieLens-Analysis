@@ -1,0 +1,223 @@
+---
+title: "Movielens Final"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+library(lubridate)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+nrow(edx)
+ncol(edx)
+
+```
+
+
+# Movielens Introduction
+
+In this paper, I will be creating a movie recommendation system using the 10M version of the [MovieLens 10M Dataset](https://grouplens.org/datasets/movielens/10m/), created by grouplens. This dataset contains 10 million ratings and 100,000 tag applications applied to 10,000 movies by 72,000 users. Recommendation system models will be evaluated using the root-mean-square error (RMSE). The root-mean-square error is simply the standard deviation of the residuals.
+
+I will train the movie recommendation model using several different machine learning methods, including regression models, KNN, and Random Forests.
+
+
+## The Dataset
+
+The data used are from GroupLens' Movielens 10M dataset. Our training set, `edx`, contains 9,000,055 observations and 6 variables.
+
+```{r}
+glimpse(edx)
+```
+
+```{r}
+n_distinct(edx$userId)
+n_distinct(edx$movieId)
+```
+
+The training set contains the ratings, on a scale of 0.5 to 5 of 10,677 movies by 69,878 users. Using this training set, I will build a model to predict the outcome, ratings. My model will be tested on the `validation` dataframe. The validation dataframe contains 999,999 observations taken from the same set of unique users.
+
+In the following section, we will explore trends in the data which can in turn be used to inform our models.
+
+## Edx Data Exploration
+
+In this section, we'll examine some of the trends we find within the data- this will help us know what controls would be helpful to adopt when we construct our recommendation system models. 
+
+First we'll look at the distribution of the ratings that users assigned movies. We can see that whole stars were given much more often than half-stars and that the ratings skew to the right. The rarest ratings are 0.5, 1.5, and 1.0.
+
+```{r}
+edx %>%
+  ggplot(aes(rating))+
+  geom_histogram(fill="peachpuff3", color="tomato1", bins =10) +
+  ggtitle("Distribution of Movie Ratings")
+```
+
+Below we see the distribution of the number of ratings submitted by each user:
+
+```{r}
+edx %>% group_by(userId) %>% 
+  summarize(count=n()) %>% 
+  arrange(desc(count)) %>% 
+  ggplot(aes(count))+
+  geom_histogram(bins=25, fill="peachpuff3", color="tomato1")+ 
+  scale_x_log10()
+```
+
+```{r}
+n_user_ratings <- edx %>% group_by(userId) %>% 
+  summarize(count=n()) %>% 
+  arrange(desc(count))
+
+n_ratings <- tibble(percent_under_500_ratings = sum(n_user_ratings$count <500)/69878*100,
+over_2000_movies_rated = sum(n_user_ratings$count > 2000),
+max_n_movies_rated = max(n_user_ratings$count))
+head(n_ratings)
+```
+
+We can see right away that there are significant differences in how many movies each user rated. Over 95% of users rated fewer than 500 films. 58 users rated over 2,000 films, and one user rated a whopping 6,616 films. This tells us that there are user effects that we can integrate into our model.
+
+
+## Methods
+
+To create a recommender system, we'll implement the model-based approach that we learned in the machine learning course on Edx. We'll first consider a model where we simply recommend the same rating for all movies and users (by taking average ratings), and then we'll add controls for movie effects, user effects, and time effects in order to lower the RMSE. 
+
+Ideally, these effects would be considered using regressions, but unfortunately, attempting to do so would likely crash this computer. Rather, we'll compute an approximation by estimating the overall mean, `mu`. We will then use this to find the movie effects, `b_i` by s the user averages, `b_u`, and then estimating the time averages, `b_t`. Each of these controls is added to our approximation of a regression line, and each subsequent feature will be added to our approximation of a regression line sequentially.
+
+The predicted results for each model wil thus be:  
+Simple Average: `mu`  
+Movie Effects: `mu` + `b_i`  
+User Effects: `mu` + `b_i` + `b_u`  
+Time Effects: `mu` + `b_i` + `b_u` + `t_u`  
+
+## Results
+
+To calculate Root Mean Squared Error, we'll use the formula below.
+```{r}
+RMSE <- function(true_ratings, predicted_ratings){
+    sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+Before anything, we'll set seed as 123. This ensures that the code will be reproducible. 
+```{r}
+set.seed(123)
+```
+
+Just the Average
+```{r}
+mu <- mean(edx$rating)
+naive_rmse <- RMSE(validation$rating, mu)
+cat("Just the Average: ", naive_rmse)
+```
+
+
+Movie Effect Model
+```{r}
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating-mu))
+
+predicted_ratings_mo <- mu + validation %>%
+  left_join(movie_avgs, by='movieId') %>% 
+  .$b_i
+
+movie_effects <- RMSE(validation$rating, predicted_ratings_mo)
+
+cat("Movie Effects: ", movie_effects)
+```
+
+
+Movie Effect + User Effects
+```{r}
+user_avgs <- edx %>%  
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings_us <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+user_effects <- RMSE(validation$rating, predicted_ratings_us)
+
+cat("User Effects: ", user_effects)
+```
+  
+Movie Effects + User Effects + Time Effects
+```{r}
+
+timeset <- validation %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "year")) 
+
+time_avgs <- edx %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "year")) %>%
+  group_by(date) %>%
+  summarize(b_t = mean(rating - mu - b_i - b_u))
+
+  predicted_ratings_tm <- timeset %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(time_avgs, by='date') %>%
+  mutate(pred = mu + b_i + b_u + b_t) %>%
+  .$pred
+  
+time_effects <- RMSE(timeset$rating, predicted_ratings_tm)
+cat("Time Effects: ", time_effects)
+```
+
+
+## Conclusion
+
+
+As our goal was to obtain an RMSE of at most 0.87750, we have succeeded in our task using only the simple linear effects models. The user effect and the time effect model both reduce error to an acceptable range. The difference between the User Effects and the model the Time Effects model is extremely low: 0.00008. 
+
+Our best RMSE was: **Time Effects:  0.8653405**
+
+
+
+
+
